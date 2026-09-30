@@ -1,0 +1,220 @@
+---
+# ДЗ: Сценарии iptables
+# 1) knocking port: centralRouter попадает на ssh inetRouter через knock-скрипт
+# 2) inetRouter2 виден с хоста (host-only); nginx на centralServer; проброс 80 -> inetRouter2:8080
+# 3) дефолт в интернет остаётся через inetRouter
+# (*) 80-й порт пробрасывается без маскарадинга (обратный маршрут на centralServer)
+
+- name: Общая подготовка роутеров
+  hosts: routers
+  become: true
+  tasks:
+    - name: Отключить ufw
+      service:
+        name: ufw
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    - name: Включить IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        sysctl_set: true
+        reload: true
+
+- name: inetRouter — knocking port
+  hosts: inetRouter
+  become: true
+  tasks:
+    - name: Установить knockd
+      apt:
+        name: knockd
+        state: present
+        update_cache: true
+
+    - name: Конфигурация knockd (последовательность 7000,8000,9000)
+      copy:
+        dest: /etc/knockd.conf
+        mode: "0644"
+        content: |
+          [options]
+              UseSyslog
+              Interface = enp0s8
+
+          [openSSH]
+              sequence    = 7000,8000,9000
+              seq_timeout = 10
+              command     = /usr/sbin/iptables -I INPUT 1 -s %IP% -p tcp --dport 22 -j ACCEPT
+              tcpflags    = syn
+
+          [closeSSH]
+              sequence    = 9000,8000,7000
+              seq_timeout = 10
+              command     = /usr/sbin/iptables -D INPUT -s %IP% -p tcp --dport 22 -j ACCEPT
+              tcpflags    = syn
+
+    - name: Базовые правила iptables (ssh закрыт до knock)
+      copy:
+        dest: /etc/iptables_rules.ipv4
+        mode: "0644"
+        content: |
+          *filter
+          :INPUT ACCEPT [0:0]
+          :FORWARD ACCEPT [0:0]
+          :OUTPUT ACCEPT [0:0]
+          -A INPUT -i lo -j ACCEPT
+          -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+          -A INPUT -p icmp -j ACCEPT
+          -A INPUT -p tcp --dport 22 -j DROP
+          COMMIT
+          *nat
+          :PREROUTING ACCEPT [0:0]
+          :INPUT ACCEPT [0:0]
+          :OUTPUT ACCEPT [0:0]
+          :POSTROUTING ACCEPT [0:0]
+          -A POSTROUTING ! -d 192.168.0.0/16 -o enp0s3 -j MASQUERADE
+          COMMIT
+
+    - name: Восстановление правил при загрузке
+      copy:
+        dest: /etc/systemd/system/iptables-restore.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Restore iptables rules
+          After=network-pre.target
+          Before=network.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/iptables-restore /etc/iptables_rules.ipv4
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: systemctl daemon-reload
+      systemd:
+        daemon_reload: true
+
+    - name: knockd запущен и в автозагрузке
+      service:
+        name: knockd
+        state: started
+        enabled: true
+
+    - name: iptables-restore в автозагрузке
+      service:
+        name: iptables-restore
+        enabled: true
+
+- name: centralRouter — knock-скрипт для доступа к inetRouter
+  hosts: centralRouter
+  become: true
+  tasks:
+    - name: Установить knock
+      apt:
+        name: knockd
+        state: present
+
+    - name: Скрипт knock-ssh.sh
+      copy:
+        dest: /usr/local/bin/knock-ssh.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Открывает ssh на inetRouter knock-последовательностью 7000,8000,9000
+          # и подключается. Использование: knock-ssh.sh [user]
+          HOST=192.168.255.1
+          USER="${1:-root}"
+          for p in 7000 8000 9000; do
+            timeout 1 bash -c "echo > /dev/tcp/$HOST/$p" 2>/dev/null
+          done
+          sleep 1
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$USER@$HOST"
+
+- name: inetRouter2 — проброс 80 -> 8080
+  hosts: inetRouter2
+  become: true
+  tasks:
+    - name: Правила DNAT (8080 -> centralServer:80, без маскарадинга)
+      copy:
+        dest: /etc/iptables_rules.ipv4
+        mode: "0644"
+        content: |
+          *filter
+          :INPUT ACCEPT [0:0]
+          :FORWARD ACCEPT [0:0]
+          :OUTPUT ACCEPT [0:0]
+          -A FORWARD -d 192.168.0.2/32 -p tcp --dport 80 -j ACCEPT
+          COMMIT
+          *nat
+          :PREROUTING ACCEPT [0:0]
+          :INPUT ACCEPT [0:0]
+          :OUTPUT ACCEPT [0:0]
+          :POSTROUTING ACCEPT [0:0]
+          -A PREROUTING -p tcp --dport 8080 -j DNAT --to-destination 192.168.0.2:80
+          COMMIT
+
+    - name: Юнит восстановления правил
+      copy:
+        dest: /etc/systemd/system/iptables-restore.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Restore iptables rules
+          After=network-pre.target
+          Before=network.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/sbin/iptables-restore /etc/iptables_rules.ipv4
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Применить и включить
+      shell: |
+        iptables-restore /etc/iptables_rules.ipv4
+        systemctl daemon-reload
+        systemctl enable iptables-restore.service
+      changed_when: true
+
+- name: centralServer — nginx и обратный маршрут
+  hosts: centralServer
+  become: true
+  tasks:
+    - name: Установить nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: true
+
+    - name: nginx запущен
+      service:
+        name: nginx
+        state: started
+        enabled: true
+
+    # (*) без маскарадинга: ответы идут напрямую хосту через inetRouter2
+    - name: Обратный маршрут к сети хоста через inetRouter2
+      copy:
+        dest: /etc/netplan/99-return-route.yaml
+        mode: "0600"
+        content: |
+          network:
+            version: 2
+            ethernets:
+              enp0s8:
+                routes:
+                  - to: 192.168.50.0/24
+                    via: 192.168.0.3
+      register: nr
+      notify: netplan apply
+
+  handlers:
+    - name: netplan apply
+      command: netplan apply

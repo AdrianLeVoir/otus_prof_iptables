@@ -1,0 +1,12 @@
+[routers]
+inetRouter   ansible_host=192.168.255.1
+inetRouter2  ansible_host=192.168.50.2
+centralRouter ansible_host=192.168.0.1
+
+[servers]
+centralServer ansible_host=192.168.0.2
+
+[all:vars]
+ansible_user=vagrant
+ansible_ssh_private_key_file=.vagrant/machines/{{ inventory_hostname }}/virtualbox/private_key
+ansible_ssh_common_args='-o StrictHostKeyChecking=no'
